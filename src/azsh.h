@@ -4,5 +4,6 @@
 #define LINE_SIZE_UNIT 80
 #define ARGV_SIZE_UNIT 10
 #define DEFAULT_PROMPT "azsh> "
+#define PATH_SEP '/'
 
 #endif

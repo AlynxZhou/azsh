@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include "history.h"
 #include "azsh.h"
 
 void error(const char *s);
@@ -16,7 +17,8 @@ char **azsh_parse_args(char **line_ptr);
 void azsh_print_args(char **argv);
 void azsh_run_command(char **argv);
 
-char *HOME = NULL;
+char *HOME;
+history_t history;
 
 int main(int argc, char *argv[])
 {
@@ -27,17 +29,37 @@ int main(int argc, char *argv[])
 
 int azsh_mainloop(void)
 {
+	history = azsh_create_history();
+	FILE *fp;
+	// HOME does not have ending `/`.
+	char history_name[] = "/.azhistory";
+	int HOME_LEN = strlen(HOME);
+	int name_len = strlen(history_name);
+	int size = HOME_LEN + name_len + 1;
+	char *history_path = malloc(sizeof(*history_path) + size);
+	strncpy(history_path, HOME, HOME_LEN);
+	strncpy(history_path + HOME_LEN, history_name, name_len + 1);
+	printf("%s\n", history_path);
+	if ((fp = fopen(history_path, "r")) != NULL) {
+		azsh_read_history(history, fp);
+	}
 	char *line = NULL;
 	while ((line = azsh_readline(DEFAULT_PROMPT)) != NULL) {
 		azsh_rtrim(line);
+		azsh_put_history(history, line);
 		char **argv = azsh_parse_args(&line);
 		if (argv != NULL) {
-			// azsh_print_args(argv);
+			azsh_print_args(argv);
 			azsh_run_command(argv);
 			free(argv);
 		}
 		free(line);
 	}
+	if ((fp = fopen(history_path, "w")) != NULL) {
+		azsh_write_history(history, fp);
+	}
+	free(history_path);
+	azsh_delete_history(history);
 	return EXIT_SUCCESS;
 }
 
@@ -96,12 +118,74 @@ void azsh_rtrim(char *line)
 	}
 }
 
-char **azsh_parse_args(char **line_ptr)
+void _azsh_replace_history(char **line_ptr)
 {
 	char *line = *line_ptr;
-	int size = ARGV_SIZE_UNIT;
-	char **argv = malloc(sizeof(*argv) * size);
-	int argv_len = 0;
+	int line_len = strlen(line);
+	// Replace history.
+	int iter_times = 0;
+	for (int i = 0; i < line_len; ++i) {
+		if (line[i] == '!') {
+			int escape_count = 0;
+			for (int j = i - 1; j >= 0; --j) {
+				if (line[j] != '\\')
+					break;
+				++escape_count;
+			}
+			if (escape_count % 2)
+				continue;
+			// `!!` is the same as `!1`,
+			// but `!1` is easier to parse.
+			if (i + 1 < line_len && line[i + 1] == '!')
+				line[i + 1] = '1';
+			int digits_count = 0;
+			for (int j = i + 1; j < line_len; ++j) {
+				if (!isdigit(line[j]))
+					break;
+				++digits_count;
+			}
+			if (!digits_count)
+				continue;
+			char *buf = malloc(sizeof(*buf) * (digits_count + 1));
+			// strncpy() automatically fill rest space with '\0'.
+			strncpy(buf, line + i + 1, digits_count + 1);
+			int num;
+			sscanf(buf, "%d", &num);
+			free(buf);
+			if (num == 0)
+				continue;
+			int current_num = num;
+			num += iter_times;
+			int start = i;
+			int stop = i + digits_count + 1;
+			char *str = azsh_get_history(history, num);
+			if (str == NULL)
+				continue;
+			int str_len = strlen(str);
+			int size = line_len - (escape_count + 1) + str_len;
+			*line_ptr = malloc(sizeof(*line) * size);
+			strncpy(*line_ptr, line, start);
+			strncpy(*line_ptr + start, str, str_len);
+			strncpy(*line_ptr + start + str_len, line + stop,
+				line_len - stop);
+			(*line_ptr)[size - 1] = '\0';
+			free(line);
+			line = *line_ptr;
+			line_len = strlen(line);
+			// If we run `ls`, `ls !!`, `ls !!`, when the third
+			// command is running, first it will be replaced with
+			// `ls ls !!`, however, `!!` here should be `!2`,
+			// so we add this each time.
+			iter_times += current_num;
+			// Must - 1 because it will be add 1 next loop.
+			--i;
+		}
+	}
+}
+
+void _azsh_replace_environment(char **line_ptr)
+{
+	char *line = *line_ptr;
 	int line_len = strlen(line);
 	// Replace env.
 	for (int i = 0; i < line_len; ++i) {
@@ -114,7 +198,7 @@ char **azsh_parse_args(char **line_ptr)
 				++escape_count;
 			}
 			if (escape_count % 2)
-				break;
+				continue;
 			int start = i + 2;
 			int stop = start;
 			for (int j = start; j < line_len; ++j) {
@@ -132,27 +216,26 @@ char **azsh_parse_args(char **line_ptr)
 			char *value = getenv(key);
 			int value_len = 0;
 			if (value == NULL) {
+				int size = line_len + 1 - (key_size - 1 + 3);
 				// `$`, `{`, `}`
-				*line_ptr = malloc(
-					sizeof(**line_ptr) *
-					(line_len + 1 - (key_size - 1 + 3)));
-				memcpy(*line_ptr, line, start - 2);
+				*line_ptr = malloc(sizeof(**line_ptr) * size);
+				strncpy(*line_ptr, line, start - 2);
 				// Line length + 1 for `\0`!
-				memcpy((*line_ptr) + start - 2, line + stop + 1,
-				       line_len + 1 - (stop + 1));
+				strncpy((*line_ptr) + start - 2,
+					line + stop + 1, line_len - (stop + 1));
+				(*line_ptr)[size - 1] = '\0';
 			} else {
 				value_len = strlen(value);
+				int size = line_len + 1 - (key_size - 1 + 3) +
+					   value_len;
 				// `$`, `{`, `}`
-				*line_ptr = malloc(sizeof(**line_ptr) *
-						   (line_len + 1 -
-						    (key_size - 1 + 3) +
-						    value_len));
-				memcpy(*line_ptr, line, start - 2);
-				memcpy((*line_ptr) + start - 2, value,
-				       value_len);
-				memcpy((*line_ptr) + start - 2 + value_len,
-				       line + stop + 1,
-				       line_len + 1 - (stop + 1));
+				*line_ptr = malloc(sizeof(**line_ptr) * size);
+				strncpy(*line_ptr, line, start - 2);
+				strncpy((*line_ptr) + start - 2, value,
+					value_len);
+				strncpy((*line_ptr) + start - 2 + value_len,
+					line + stop + 1, line_len - (stop + 1));
+				(*line_ptr)[size - 1] = '\0';
 			}
 			free(line);
 			line = *line_ptr;
@@ -161,6 +244,17 @@ char **azsh_parse_args(char **line_ptr)
 			i = start - 2 + value_len - 1;
 		}
 	}
+}
+
+char **azsh_parse_args(char **line_ptr)
+{
+	int size = ARGV_SIZE_UNIT;
+	char **argv = malloc(sizeof(*argv) * size);
+	int argv_len = 0;
+	_azsh_replace_history(line_ptr);
+	_azsh_replace_environment(line_ptr);
+	char *line = *line_ptr;
+	int line_len = strlen(line);
 	bool leading_spaces = true;
 	bool prev_space = true;
 	bool in_double_quote = false;
@@ -189,8 +283,17 @@ char **azsh_parse_args(char **line_ptr)
 					line[j] = line[j + 1];
 				--line_len;
 				break;
+			case '$':
+				for (int j = i; j < line_len; ++j)
+					line[j] = line[j + 1];
+				--line_len;
+				break;
+			case '!':
+				for (int j = i; j < line_len; ++j)
+					line[j] = line[j + 1];
+				--line_len;
+				break;
 			case '\\':
-				line[i + 1] = '\\';
 				for (int j = i; j < line_len; ++j)
 					line[j] = line[j + 1];
 				--line_len;
@@ -255,12 +358,18 @@ void azsh_print_args(char **argv)
 void azsh_run_command(char **argv)
 {
 	pid_t pid = fork();
-	if (pid > 0)
+	if (pid > 0) {
 		wait(NULL);
-	else if (pid < 0)
+	} else if (pid < 0) {
 		error("Fork Error\n");
-	else
-		exit(execvp(argv[0], argv));
+	} else {
+		if (!strcmp("history", argv[0])) {
+			azsh_write_history(history, stdout);
+			exit(0);
+		} else {
+			exit(execvp(argv[0], argv));
+		}
+	}
 }
 
 void error(const char *s)
